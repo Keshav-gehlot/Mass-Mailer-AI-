@@ -1,0 +1,263 @@
+import React, { useState, useCallback, useEffect } from 'react';
+import type { Recipient, EmailStatus } from './types';
+import { Status } from './types';
+import RecipientInput from './components/RecipientInput';
+import EmailEditor from './components/EmailEditor';
+import EmailPreview from './components/EmailPreview';
+import StatusLog from './components/StatusLog';
+import { generateEmailContent, personalizeEmail } from './services/geminiService';
+import { PaperAirplaneIcon } from './components/icons/PaperAirplaneIcon';
+import SenderInfo from './components/SenderInfo';
+import EmailModal from './components/EmailModal';
+import { DownloadIcon } from './components/icons/DownloadIcon';
+import EmailJSConfig from './components/EmailJSConfig';
+
+// Make emailjs available globally
+declare const emailjs: any;
+
+export default function App() {
+  const [senderName, setSenderName] = useState<string>('The AI Team');
+  const [senderEmail, setSenderEmail] = useState<string>('team@example.com');
+  const [recipients, setRecipients] = useState<Recipient[]>([]);
+  const [subjectTemplate, setSubjectTemplate] = useState<string>('Welcome, {{name}}!');
+  const [bodyTemplate, setBodyTemplate] = useState<string>('Hi {{name}},\n\nThis is an email for you regarding {{product}}.\n\nBest,\nTeam');
+  const [emailStatuses, setEmailStatuses] = useState<Map<string, EmailStatus>>(new Map());
+  const [isSending, setIsSending] = useState<boolean>(false);
+  const [generationCompleted, setGenerationCompleted] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+  const [previewRecipientId, setPreviewRecipientId] = useState<string | null>(null);
+  const [viewingEmail, setViewingEmail] = useState<{
+    recipient: Recipient;
+    status: EmailStatus;
+  } | null>(null);
+
+  // EmailJS Configuration State
+  const [emailJsServiceId, setEmailJsServiceId] = useState('');
+  const [emailJsTemplateId, setEmailJsTemplateId] = useState('');
+  const [emailJsPublicKey, setEmailJsPublicKey] = useState('');
+  
+  useEffect(() => {
+    // Initialize EmailJS SDK
+    if (emailJsPublicKey) {
+      emailjs.init({ publicKey: emailJsPublicKey });
+    }
+  }, [emailJsPublicKey]);
+
+  const handleRecipientsChange = useCallback((newRecipients: Recipient[]) => {
+    setRecipients(newRecipients);
+    setGenerationCompleted(false); // Reset on new recipients
+    if (newRecipients.length > 0 && !previewRecipientId) {
+      setPreviewRecipientId(newRecipients[0].id);
+    } else if (newRecipients.length === 0) {
+      setPreviewRecipientId(null);
+    }
+  }, [previewRecipientId]);
+
+  const handleGenerateContent = async (prompt: string) => {
+    try {
+      setError(null);
+      const content = await generateEmailContent(prompt);
+      if (content) {
+        setSubjectTemplate(content.subject);
+        setBodyTemplate(content.body);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An unknown error occurred during content generation.');
+      console.error(err);
+    }
+  };
+
+  const handleSendAll = async () => {
+    if (!emailJsServiceId || !emailJsTemplateId || !emailJsPublicKey) {
+        setError('Please configure your EmailJS credentials before sending.');
+        return;
+    }
+    if (recipients.length === 0 || !subjectTemplate || !bodyTemplate || !senderEmail || !senderName) {
+      setError('Please provide sender info, recipients, a subject, and a body template before sending.');
+      return;
+    }
+
+    setIsSending(true);
+    setGenerationCompleted(false);
+    setError(null);
+
+    const initialStatuses = new Map<string, EmailStatus>();
+    recipients.forEach(r => initialStatuses.set(r.id, { status: Status.QUEUED }));
+    setEmailStatuses(initialStatuses);
+    
+    const sendPromises = recipients.map(async (recipient) => {
+      try {
+        setEmailStatuses(prev => new Map(prev).set(recipient.id, { status: Status.SENDING }));
+        
+        const personalizedContent = await personalizeEmail(recipient, subjectTemplate, bodyTemplate);
+        
+        const templateParams = {
+            from_name: senderName,
+            to_email: recipient.email,
+            subject: personalizedContent.subject,
+            body: personalizedContent.body,
+        };
+        
+        await emailjs.send(emailJsServiceId, emailJsTemplateId, templateParams);
+
+        setEmailStatuses(prev => new Map(prev).set(recipient.id, { status: Status.SENT, personalizedContent }));
+      } catch (err: any) {
+        const errorMessage = err?.text || (err instanceof Error ? err.message : 'Unknown send error');
+        setEmailStatuses(prev => new Map(prev).set(recipient.id, { status: Status.FAILED, error: errorMessage }));
+        console.error(`Failed to send to ${recipient.email}:`, err);
+      }
+    });
+
+    await Promise.all(sendPromises);
+
+    setIsSending(false);
+    setGenerationCompleted(true);
+  };
+
+  const handleDownloadAll = () => {
+    let content = `--- GENERATED EMAILS ---\nThis file contains all the emails generated by the Mass Mailer AI.\n\n`;
+    let sentCount = 0;
+    
+    recipients.forEach(recipient => {
+        const status = emailStatuses.get(recipient.id);
+        if (status?.status === Status.SENT && status.personalizedContent) {
+            content += '------------------------------------------------------------\n';
+            content += `From: ${senderName} <${senderEmail}>\n`;
+            content += `To: ${recipient.email}\n`;
+            content += `Subject: ${status.personalizedContent.subject}\n\n`;
+            content += `${status.personalizedContent.body}\n`;
+            content += '------------------------------------------------------------\n\n';
+            sentCount++;
+        }
+    });
+
+    if (sentCount === 0) {
+        alert("No emails were successfully generated to download.");
+        return;
+    }
+
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `generated-emails-${new Date().toISOString()}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+};
+
+
+  const handleViewEmail = (recipientId: string) => {
+    const recipient = recipients.find(r => r.id === recipientId);
+    const status = emailStatuses.get(recipientId);
+    if (recipient && status?.status === Status.SENT && status.personalizedContent) {
+        setViewingEmail({ recipient, status });
+    }
+  };
+
+
+  const previewRecipient = recipients.find(r => r.id === previewRecipientId) || null;
+  const successfullySentCount = Array.from(emailStatuses.values()).filter(s => s.status === Status.SENT).length;
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-300">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pb-32">
+        <header className="py-10 text-center border-b border-slate-800">
+          <h1 className="text-4xl sm:text-5xl font-bold text-white tracking-tight">
+            Mass Mailer <span className="text-sky-400">AI</span>
+          </h1>
+          <p className="text-slate-400 mt-4 max-w-2xl mx-auto">
+            Craft and send hyper-personalized email campaigns with the power of generative AI.
+          </p>
+        </header>
+
+        {error && (
+          <div className="bg-red-500/10 border border-red-500/30 text-red-400 px-4 py-3 rounded-lg relative my-8" role="alert">
+            <strong className="font-bold">Error: </strong>
+            <span className="block sm:inline">{error}</span>
+          </div>
+        )}
+
+        <main className="grid grid-cols-1 lg:grid-cols-2 gap-8 py-8">
+          <div className="flex flex-col gap-8">
+            <EmailJSConfig 
+              serviceId={emailJsServiceId}
+              onServiceIdChange={setEmailJsServiceId}
+              templateId={emailJsTemplateId}
+              onTemplateIdChange={setEmailJsTemplateId}
+              publicKey={emailJsPublicKey}
+              onPublicKeyChange={setEmailJsPublicKey}
+              isSending={isSending}
+            />
+            <SenderInfo
+              senderName={senderName}
+              onSenderNameChange={setSenderName}
+              senderEmail={senderEmail}
+              onSenderEmailChange={setSenderEmail}
+              isSending={isSending}
+            />
+            <RecipientInput onRecipientsChange={handleRecipientsChange} />
+            <EmailEditor
+              subject={subjectTemplate}
+              onSubjectChange={setSubjectTemplate}
+              body={bodyTemplate}
+              onBodyChange={setBodyTemplate}
+              onGenerate={handleGenerateContent}
+              isSending={isSending}
+            />
+          </div>
+          <div className="flex flex-col gap-8 lg:sticky lg:top-8 self-start">
+            <EmailPreview
+              recipient={previewRecipient}
+              recipients={recipients}
+              onRecipientChange={setPreviewRecipientId}
+              subjectTemplate={subjectTemplate}
+              bodyTemplate={bodyTemplate}
+              senderName={senderName}
+              senderEmail={senderEmail}
+            />
+            <StatusLog 
+              statuses={emailStatuses} 
+              recipients={recipients} 
+              onViewEmail={handleViewEmail}
+            />
+          </div>
+        </main>
+      </div>
+
+      <footer className="fixed bottom-0 left-0 right-0 py-4 bg-slate-900/80 backdrop-blur-sm border-t border-slate-800">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row justify-center items-center gap-4">
+            <button
+              onClick={handleSendAll}
+              disabled={isSending || recipients.length === 0}
+              className="w-full max-w-xs bg-sky-600 hover:bg-sky-700 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-bold py-3 px-6 rounded-lg shadow-lg shadow-sky-900/50 transition-all duration-200 focus:outline-none focus:ring-4 focus:ring-sky-500/50 flex items-center justify-center gap-3 text-lg"
+            >
+              <PaperAirplaneIcon className="w-6 h-6" />
+              {isSending ? `Sending... (${successfullySentCount}/${recipients.length})` : `Send All ${recipients.length > 0 ? `(${recipients.length})` : ''} Emails`}
+            </button>
+            {generationCompleted && successfullySentCount > 0 && (
+              <button
+                  onClick={handleDownloadAll}
+                  className="w-full max-w-xs bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 px-6 rounded-lg shadow-lg shadow-emerald-900/50 transition-all duration-200 focus:outline-none focus:ring-4 focus:ring-emerald-500/50 flex items-center justify-center gap-3 text-lg"
+              >
+                  <DownloadIcon className="w-6 h-6" />
+                  Download All ({successfullySentCount})
+              </button>
+            )}
+          </div>
+        </footer>
+      
+      {viewingEmail && (
+        <EmailModal
+            isOpen={!!viewingEmail}
+            onClose={() => setViewingEmail(null)}
+            senderName={senderName}
+            senderEmail={senderEmail}
+            recipient={viewingEmail.recipient}
+            emailContent={viewingEmail.status.personalizedContent!}
+        />
+      )}
+    </div>
+  );
+}

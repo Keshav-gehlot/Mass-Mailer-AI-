@@ -1,0 +1,5 @@
+{
+  "name": "Mass Mailer AI",
+  "description": "An intelligent mass mailing application that uses AI to generate and personalize email campaigns. Easily manage recipient lists, craft compelling content with AI assistance, preview personalized emails, and track sending status in real-time.",
+  "requestFramePermissions": []
+}
